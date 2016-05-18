@@ -1,5 +1,7 @@
 # deploy-ecs
 
+Deploy images to ECS.
+
 ```js
 import deployEcs from 'deploy-ecs';
 
