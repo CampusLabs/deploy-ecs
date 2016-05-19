@@ -4,58 +4,63 @@ const ecs = new ECS();
 
 const getTaskDefinition = ({cluster, service}) =>
   ecs.describeServices({cluster, services: [service]}).promise()
-    .then(({services: {0: {taskDefinition}}}) =>
-      ecs.describeTaskDefinition({taskDefinition}).promise()
-    )
+    .then(({services}) => {
+      if (!services.length) {
+        throw new Error(`Cannot find service ${service} in cluster ${cluster}`);
+      }
+
+      const {0: {taskDefinition}} = services;
+      return ecs.describeTaskDefinition({taskDefinition}).promise();
+    })
     .then(({taskDefinition}) => taskDefinition);
 
 const updateContainerDefinition = ({containerDefinition, images}) => {
-  const {image: existingImage} = containerDefinition;
-  const [existingRepo] = existingImage.split(':');
-  return images.reduce((containerDefinition, image) =>
-    image.split(':')[0] === existingRepo && image !== existingImage ?
-    Object.assign({}, containerDefinition, {image}) :
-    containerDefinition
-  , containerDefinition);
-};
-
-const updateContainerDefinitions = ({containerDefinitions, images}) => {
-  for (let i = 0, l = containerDefinitions.length; i < l; ++i) {
-    const containerDefinition = containerDefinitions[i];
-    const newContainerDefinition =
-      updateContainerDefinition({containerDefinition, images});
-    if (newContainerDefinition === containerDefinition) continue;
-
-    containerDefinitions = containerDefinitions.slice();
-    containerDefinitions[i] = containerDefinition;
+  const [existingRepo] = containerDefinition.image.split(':');
+  for (let i = 0, l = images.length; i < l; ++i) {
+    const image = images[i];
+    const [repo] = image.split(':');
+    if (repo === existingRepo) {
+      return Object.assign({}, containerDefinition, {image});
+    }
   }
-  return containerDefinitions;
+  return containerDefinition;
 };
 
 const updateTaskDefinition = ({taskDefinition, images}) => {
   const {containerDefinitions, family, volumes} = taskDefinition;
-  const newTaskDefinition = {
+  return ecs.registerTaskDefinition({
     family,
     volumes,
-    containerDefinitions:
-      updateContainerDefinitions({containerDefinitions, images})
-  };
-
-  return (
-    newTaskDefinition.containerDefinitions === containerDefinitions ?
-    Promise.resolve({taskDefinition}) :
-    ecs.registerTaskDefinition(newTaskDefinition).promise()
-  ).then(({taskDefinition: {taskDefinitionArn: tdarn}}) => tdarn);
+    containerDefinitions: containerDefinitions.map(containerDefinition =>
+      updateContainerDefinition({containerDefinition, images})
+    )
+  }).promise().then(({taskDefinition}) => taskDefinition);
 };
 
 const updateService = ({cluster, service, taskDefinition}) =>
-  ecs.updateService({cluster, service, taskDefinition}).promise();
+  ecs.updateService({
+    cluster,
+    service,
+    taskDefinition: taskDefinition.taskDefinitionArn
+  }).promise();
 
 const waitForStable = ({cluster, service}) =>
   ecs.waitFor('servicesStable', {cluster, services: [service]}).promise();
 
+const wrapError = obj =>
+  er => { throw Object.assign(new Error(er.message), er, obj); };
+
 module.exports = ({cluster, service, images}) =>
   getTaskDefinition({cluster, service})
-    .then(taskDefinition => updateTaskDefinition({taskDefinition, images}))
-    .then(tdarn => updateService({cluster, service, taskDefinition: tdarn}))
-    .then(() => waitForStable({cluster, service}));
+    .then(prevTaskDefinition =>
+      updateTaskDefinition({taskDefinition: prevTaskDefinition, images})
+        .then(nextTaskDefinition =>
+          updateService({
+            cluster,
+            service,
+            taskDefinition: nextTaskDefinition
+          }).then(() => waitForStable({cluster, service}))
+            .then(() => ({prevTaskDefinition, nextTaskDefinition}))
+            .catch(wrapError({nextTaskDefinition}))
+        ).catch(wrapError({prevTaskDefinition}))
+  );
